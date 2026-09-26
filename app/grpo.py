@@ -7,32 +7,26 @@ GRPO 在本方案里贡献的是「信用分配」而不是「梯度」：
     3. 用 A_i 的正负挑出「正样本 / 负样本」，让 LLM 对照蒸馏出可复用规则
     4. 规则写回 θ（app/asset.py）
 
-第 2 步可以精确复现原论文。第 3 步不是梯度下降 —— 它是一次启发式搜索，
-数学上不保证策略单调提升，也不保证 θ 的改进方向正确。所以本文件做了三件事
-来兜住这个不确定性：
-
-  - **θ 质量闸门**：本轮 eval 变差就自动回滚到基线快照，不让坏规则留下
-  - **步级信用**：把轨迹级优势下钻到「第几步的什么改动带来了提升」，喂给蒸馏
-  - **自治边界**：安全红线 / 无学习信号 / 预算超支 / 异常 → 停机并升级人工
-
-训练是否有效，只认 eval 集的训练前后对照（TrainResult.baseline vs final）。
-组内奖励若没有方差，优势恒为 0，训练什么都不会发生（这是正确行为，不是 bug）。
+第 2 步精确复现原论文。第 3 步不是梯度下降，只是一次启发式搜索，数学上不保证策略单调
+提升，所以本文件用三件事兜住这个不确定性：θ 质量闸门（eval 变差自动回滚）、步级信用
+（优势下钻到「第几步的什么改动带来提升」）、自治边界（安全红线 / 无信号 / 预算 / 异常
+→ 停机升级人工）。训练是否有效只认 eval 集的前后对照；组内奖励无方差则优势恒为 0，
+训练什么都不会发生（这是正确行为，不是 bug）。
 """
 
 import asyncio
 import json
 import re
+import statistics
 import uuid
 from datetime import datetime
 from typing import List, Optional, Tuple
-
-import numpy as np
-from openai import AsyncOpenAI
 
 from app.agent import Agent
 from app.asset import AssetStore
 from app.config import settings
 from app.judge import Judge
+from app.llm import client
 from app.models import (
     Escalation,
     EvalResult,
@@ -50,16 +44,17 @@ from app.trace import TraceStore
 def group_advantages(rewards: List[float], eps: Optional[float] = None) -> List[float]:
     """GRPO 的组内相对优势：A_i = (r_i - mean(r)) / (std(r) + eps)。
 
-    用样本标准差（numpy 默认 ddof=0）。方差为 0 时返回全 0 ——
-    这正是 GRPO 的行为：组内没有差异就没有学习信号，不该人为造梯度。
+    用总体标准差（pstdev，ddof=0），与 GRPO 原式一致；方差为 0 时返回全 0 ——
+    组内没有差异就没有学习信号，不该人为造梯度。
     """
     eps = settings.ADVANTAGE_EPS if eps is None else eps
-    arr = np.asarray(rewards, dtype=np.float64)
-    if arr.size == 0:
+    if not rewards:
         return []
-    if float(arr.std()) < 1e-9:
-        return [0.0] * int(arr.size)
-    return ((arr - arr.mean()) / (arr.std() + eps)).tolist()
+    std = statistics.pstdev(rewards)
+    if std < 1e-9:
+        return [0.0] * len(rewards)
+    mean = statistics.fmean(rewards)
+    return [(r - mean) / (std + eps) for r in rewards]
 
 
 _DISTILL_PROMPT = """这是一次对照实验的结果。请从中总结「可复用的经验」，用于改进未来所有同类任务的解法。
@@ -142,14 +137,8 @@ class GRPOTrainer:
         self.task_type = task_type
         self.store = AssetStore(task_type)
         self.judge = Judge()
-        if not settings.llm_configured:
-            raise RuntimeError("DEEPSEEK_API_KEY 未配置。")
-        # 蒸馏用独立 client：它的角色是「策略改进」，与 Judge 的「打分」不是一回事，
-        # 未来换成更强的模型做蒸馏时不该影响打分链路。
-        self.client = AsyncOpenAI(
-            api_key=settings.DEEPSEEK_API_KEY,
-            base_url=settings.DEEPSEEK_BASE_URL,
-        )
+        # 蒸馏复用同一个 client：它传的 model 与 Judge 不同，但连接参数一致
+        self.client = client()
         self.trace = TraceStore()
         self.status = TrainingStatus(task_type=task_type)
         self.result: Optional[TrainResult] = None
@@ -164,9 +153,16 @@ class GRPOTrainer:
     def _reset_meters(self) -> None:
         self._prompt_tokens = 0
         self._completion_tokens = 0
+        self._cache_hit_tokens = 0
+        self._cache_miss_tokens = 0
         self._judge_tokens = 0
         self._distill_tokens = 0
         self._llm_calls = 0
+
+    @property
+    def cache_hit_rate(self) -> float:
+        total = self._cache_hit_tokens + self._cache_miss_tokens
+        return round(self._cache_hit_tokens / total, 4) if total else 0.0
 
     # ---------- 对外控制 ----------
 
@@ -176,10 +172,9 @@ class GRPOTrainer:
     # ---------- 自治边界 ----------
 
     def _escalate(self, code: str, detail: str) -> None:
-        """登记一条需要人工介入的事件。
+        """登记一条需要人工介入的事件（安全红线 / 回归 / 无信号 / 预算 / 异常）。
 
-        安全红线 / 回归 / 无学习信号 / 预算 / 异常 —— 这五类之外的失败都由
-        系统自行处理（重试、降级、跳过），不需要人来看。
+        这五类之外的失败都由系统自行处理（重试、降级、跳过）。
         """
         self.escalations.append(
             Escalation(
@@ -205,6 +200,11 @@ class GRPOTrainer:
     def _sync_meters(self) -> None:
         self.status.prompt_tokens = self._prompt_tokens
         self.status.completion_tokens = self._completion_tokens
+        self.status.cache_hit_tokens = self._cache_hit_tokens
+        self.status.cache_miss_tokens = self._cache_miss_tokens
+        self.status.judge_tokens = self._judge_tokens
+        self.status.distill_tokens = self._distill_tokens
+        self.status.llm_calls = self._llm_calls
 
     # ---------- 内部工具 ----------
 
@@ -226,6 +226,8 @@ class GRPOTrainer:
             self._llm_calls += traj.llm_calls + 1  # +1 = judge 那次调用
             self._prompt_tokens += traj.prompt_tokens
             self._completion_tokens += traj.completion_tokens
+            self._cache_hit_tokens += traj.cache_hit_tokens
+            self._cache_miss_tokens += traj.cache_miss_tokens
             self._judge_tokens += traj.judge_tokens
             traj.trace_path = self.trace.write_trajectory(traj, task)
             self._sync_meters()
@@ -250,9 +252,8 @@ class GRPOTrainer:
     ) -> Tuple[List[Rule], str, List[str], int]:
         """找出组内正负样本，让 LLM 对照蒸馏出规则。
 
-        返回 (规则, 失败原因, 证据轨迹 id, 证据步号)。失败原因必须向上传：
-        「优势明明够大却没写进任何规则」是使用者最需要能自己归因的情况，
-        如果只把原因写在 status.message 上，会被后续的状态更新覆盖掉。
+        返回 (规则, 失败原因, 证据轨迹 id, 证据步号)。失败原因必须向上传 ——
+        只写在 status.message 上会被后续的状态更新覆盖掉。
         """
         winner = max(group, key=lambda t: t.advantage)
         loser = min(group, key=lambda t: t.advantage)
@@ -298,8 +299,7 @@ class GRPOTrainer:
     def _is_regression(baseline: EvalResult, final: EvalResult, tol: float = 1e-6) -> bool:
         """判定 θ 是否变差。
 
-        主判据用 avg_verify_score（客观、连续）：成功率经常是 0%↔0%，
-        没有分辨率；通过率能看出"退步了一点"。成功率作为并列判据。
+        主判据 avg_verify_score（客观、连续）；成功率经常 0%↔0%，只作并列判据。
         """
         if final.avg_verify_score < baseline.avg_verify_score - tol:
             return True
@@ -412,7 +412,7 @@ class GRPOTrainer:
                     all_rewards.extend(rewards)
                     all_success += sum(1 for t in group if t.success)
 
-                    is_flat = float(np.std(np.asarray(rewards))) < 1e-9
+                    is_flat = statistics.pstdev(rewards) < 1e-9
                     if is_flat:
                         flat_groups += 1
                         flat_streak += 1
@@ -525,6 +525,11 @@ class GRPOTrainer:
                 regressed_final=regressed,
                 prompt_tokens=self._prompt_tokens,
                 completion_tokens=self._completion_tokens,
+                cache_hit_tokens=self._cache_hit_tokens,
+                cache_miss_tokens=self._cache_miss_tokens,
+                judge_tokens=self._judge_tokens,
+                distill_tokens=self._distill_tokens,
+                llm_calls=self._llm_calls,
                 needs_human=bool(self.escalations),
                 escalations=list(self.escalations),
             )
@@ -536,6 +541,7 @@ class GRPOTrainer:
                 f"v{baseline.asset_version}→v{final.asset_version}，"
                 f"eval 成功率 {baseline.success_rate:.0%}→{final.success_rate:.0%}，"
                 f"tokens {self._tokens_used()}"
+                f"（输入 {self._prompt_tokens} 中缓存命中 {self.cache_hit_rate:.0%}）"
             )
             if rollback_reason:
                 msg += "｜已回滚 θ（本轮变差）"

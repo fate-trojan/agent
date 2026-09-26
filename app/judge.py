@@ -17,9 +17,8 @@ import json
 import re
 from typing import Tuple
 
-from openai import AsyncOpenAI
-
 from app.config import settings
+from app.llm import client
 from app.models import TaskSpec, Trajectory
 
 _JUDGE_PROMPT = """你是一个严格的代码评审。请评估这次「解题过程」的质量，不要只盯最终对错。
@@ -49,12 +48,7 @@ score 取值范围 0.0 ~ 1.0。"""
 
 class Judge:
     def __init__(self) -> None:
-        if not settings.llm_configured:
-            raise RuntimeError("DEEPSEEK_API_KEY 未配置，无法启用 Judge。")
-        self.client = AsyncOpenAI(
-            api_key=settings.DEEPSEEK_API_KEY,
-            base_url=settings.DEEPSEEK_BASE_URL,
-        )
+        self.client = client()
 
     async def _llm_score(
         self, traj: Trajectory, task: TaskSpec

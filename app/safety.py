@@ -3,10 +3,8 @@
 为什么必须是 AST 而不是正则：正则会被 `__import__("o"+"s")`、`getattr(os, "system")`
 这类拼接绕过，而 AST 看到的是真实的 import 与调用节点。
 
-这里的定位很清楚 —— 它是一道「禁止操作清单」闸门，不是沙箱。
-真正能防住恶意代码的只有进程/网络/文件系统级隔离，而本实现没有（见 README 风险清单）。
-这道闸门能挡住的是：模型在正常解题过程中顺手写出越界操作（读写文件、发网络请求、
-读环境变量里的密钥、开子进程），以及最直白的沙箱逃逸尝试。
+这里的定位很清楚 —— 它是一道「禁止操作清单」闸门，不是沙箱。真正能防住恶意代码的
+只有进程/网络/文件系统级隔离，而本实现没有（见 README 风险清单）。
 """
 
 import ast
@@ -75,9 +73,8 @@ _PASSTHROUGH_ENV: Tuple[str, ...] = ("PATH", "LANG", "LC_ALL", "TZ", "HOME")
 def scrubbed_env(base: Dict[str, str]) -> Dict[str, str]:
     """构造子进程环境变量：只保留白名单。
 
-    关键作用：默认继承的 os.environ 里带着 DEEPSEEK_API_KEY，被测代码
-    一句 `os.environ["DEEPSEEK_API_KEY"]` 就能把密钥读走。这里把它连同其他
-    所有变量一起剥掉，只留跑 Python 必需的几个。
+    默认继承的 os.environ 里带着 DEEPSEEK_API_KEY，被测代码一句
+    `os.environ["DEEPSEEK_API_KEY"]` 就能把它读走，所以连同其他变量一起剥掉。
     """
     out = {k: base[k] for k in _PASSTHROUGH_ENV if k in base}
     out["PYTHONIOENCODING"] = "utf-8"
@@ -86,9 +83,9 @@ def scrubbed_env(base: Dict[str, str]) -> Dict[str, str]:
 
 
 def scan(code: str) -> List[SafetyViolation]:
-    """扫描代码里的越界操作。语法错误不在这里报（由执行器报编译错误）。
+    """扫描代码里的越界操作，返回空列表 = 未命中任何红线。
 
-    返回空列表 = 未命中任何红线。
+    语法错误不在这里报（交给执行器给出编译错误更准确）。
     """
     src = (code or "").strip()
     if not src:
@@ -145,8 +142,3 @@ def _call_name(func: ast.AST) -> str:
     if isinstance(func, ast.Attribute):
         return func.attr
     return ""
-
-
-def blocked(violations: List[SafetyViolation]) -> bool:
-    """是否存在会导致拒绝执行的红线。"""
-    return bool(violations)

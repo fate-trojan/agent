@@ -1,8 +1,8 @@
 """轨迹与训练运行的落盘（可审计性）。
 
 为什么用 JSONL 而不是数据库：#4 要求的是「可回溯」，一行一条 JSON 可以被
-grep / diff / jq 直接消费，不引入依赖，也不会因为写入失败而中断训练。
-所有写操作失败都吞掉并返回空路径 —— 审计是旁路，不能反噬主流程。
+grep / diff / jq 直接消费，不引入依赖。写操作失败一律吞掉并返回空路径 ——
+审计是旁路，不能反噬主流程。
 
 三类记录：
     traj-YYYYMMDD.jsonl   一条完整轨迹（含每步动作、观测、耗时、token、判定）
@@ -23,8 +23,8 @@ from app.models import Rule, TaskSpec, TrainResult, Trajectory
 def tests_fingerprint(task: TaskSpec) -> str:
     """隐藏用例的指纹。
 
-    轨迹落盘时不存用例正文（正文在 tasks.py 里由 git 版本化），只存指纹。
-    这样"这次判定用的是哪一版用例"可以被验证，而不会让轨迹文件膨胀。
+    轨迹不存用例正文（正文在 tasks.py 里由 git 版本化），只存指纹：既能验证
+    「这次判定用的是哪一版用例」，又不会让轨迹文件膨胀。
     """
     payload = json.dumps(
         {"entry": task.entry_point, "tests": task.tests}, ensure_ascii=False, sort_keys=True
@@ -35,8 +35,8 @@ def tests_fingerprint(task: TaskSpec) -> str:
 class TraceStore:
     """append-only 审计日志。"""
 
-    def __init__(self, root: Optional[str] = None) -> None:
-        self.root = Path(root or settings.TRACE_DIR)
+    def __init__(self) -> None:
+        self.root = Path(settings.TRACE_DIR)
         self.enabled = settings.TRACE_ENABLED
 
     # ---------- 写 ----------
@@ -141,3 +141,32 @@ class TraceStore:
             if item.get("trajectory_id") == trajectory_id:
                 return item
         return None
+
+    def last_turn(self, session_id: str, scan: int = 50) -> List[Dict[str, str]]:
+        """取该会话最近一轮的「提问 + 产出」，作为下一轮的对话前缀。
+
+        产出可能是代码（codegen）也可能是一段回答（chat），两种都要能回放 ——
+        否则闲聊一轮之后再问「接着说」，模型就断片了。
+
+        会话记忆就存在已有的审计日志里，不另开一套存储 —— 服务重启后依然接得上。
+        ponytail: 只回看最近 scan 条轨迹，够单人连续对话；会话一多就该按
+        session_id 建索引，现在是线性扫。
+        """
+        if not self.enabled or not session_id:
+            return []
+        for item in self.recent_trajectories(limit=scan):
+            traj = item.get("trajectory") or {}
+            if traj.get("session_id") != session_id:
+                continue
+            if traj.get("final_code"):
+                # 代码按它自己在轨迹里的原样回放，带上 <final> 标签
+                answer = f"<final>\n```python\n{traj['final_code']}\n```\n</final>"
+            elif traj.get("reply"):
+                answer = traj["reply"]
+            else:
+                continue
+            return [
+                {"role": "user", "content": traj.get("task_prompt", "")},
+                {"role": "assistant", "content": answer},
+            ]
+        return []

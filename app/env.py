@@ -10,11 +10,7 @@
     G  目标      —— 隐藏测试全部通过；自由任务无客观目标，由 judge 代理
     terminate    —— 模型调用 submit，或达到 max_steps
 
-与「简单接一个工具 API」的区别在于：这里的状态是真实的（每次 attempt 都改变
-attempts/best/denied），每次转移都先过校验与安全闸门，且返回的每一步都可审计
-（StepRecord）。rollout 只是驱动这个环境循环的薄壳。
-
-隔离边界（必须说清）：执行手段只有「独立进程 + 超时 + 干净环境变量 + -I 隔离模式」，
+隔离边界：执行手段只有「独立进程 + 超时 + 干净环境变量 + -I 隔离模式」，
 没有网络 / 文件系统 / 内核级隔离。安全闸门是禁止操作清单，不是沙箱。
 """
 
@@ -33,11 +29,10 @@ from app.models import (
     Action,
     Observation,
     SafetyViolation,
-    State,
     StepRecord,
     TaskSpec,
 )
-from app.safety import blocked, scan, scrubbed_env
+from app.safety import scan, scrubbed_env
 
 #: 该环境只暴露一个工具。模型给出别的 tool_name 一律拒绝
 ALLOWED_TOOLS = ("execute_code",)
@@ -132,11 +127,8 @@ def run_tests(
 ) -> Tuple[float, List[Dict[str, Any]], str]:
     """在子进程里跑隐藏测试，返回 (通过率, 逐用例明细, 错误信息)。
 
-    通过率而非 0/1 二值，是为了给 GRPO 提供有方差的奖励信号 ——
-    如果组内奖励全相等，优势恒为 0，训练不会发生。
-
-    注意：没有隐藏用例的自由任务不该走这里（拿不到任何有效判定），
-    要用 run_code()。
+    通过率而非 0/1 二值，是为了给 GRPO 提供有方差的奖励信号。
+    没有隐藏用例的自由任务不该走这里（拿不到有效判定），要用 run_code()。
     """
     if not code.strip():
         return 0.0, [], "代码为空"
@@ -178,16 +170,15 @@ def run_tests(
 def run_code(code: str) -> Tuple[bool, str]:
     """只执行、不判定对错 —— 用于没有隐藏用例的自由任务。
 
-    这类任务环境给不出可验证奖励（reward 全来自 judge），但模型依然需要真实的
-    执行反馈才能自我修复。返回 (是否正常退出, 输出文本)。
+    返回 (是否正常退出, 输出文本)；没有输出就返回空串，由调用方决定怎么措辞
+    （不要在这里编一句"运行成功"把"什么都没发生"说成成功）。
     """
     if not code.strip():
         return False, "代码为空"
     rc, stdout, stderr = _run_python({"main.py": code}, "main.py")
     if rc is None:
         return False, stderr
-    out = (stdout + stderr).strip()
-    return rc == 0, (out[-800:] if out else "（运行成功，无任何输出）")
+    return rc == 0, (stdout + stderr).strip()[-800:]
 
 
 # ===================== 环境 =====================
@@ -204,7 +195,7 @@ class CodeEnv:
 
     # ---------- 状态 ----------
 
-    def reset(self) -> State:
+    def reset(self) -> None:
         """回到初始状态 s₀。"""
         self.step = 0
         self.attempts: List[Dict[str, Any]] = []
@@ -214,10 +205,9 @@ class CodeEnv:
         self.denied = 0
         self.violations: List[SafetyViolation] = []
         self.terminated_by = ""
-        return State(env_state=self.snapshot(), step=0)
 
     def snapshot(self) -> Dict[str, Any]:
-        """当前环境状态的只读快照。会随每次转移真实改变，不是摆设。"""
+        """当前环境状态的只读快照。"""
         return {
             "task_id": self.task.id,
             "step": self.step,
@@ -244,10 +234,9 @@ class CodeEnv:
     def dispatch(
         self, action: Action, llm: Optional[Dict[str, Any]] = None
     ) -> Tuple[Optional[Observation], StepRecord]:
-        """唯一的动作入口。
+        """唯一的动作入口，返回 (观测, 步记录)。
 
-        返回 (观测, 步记录)。提交类动作返回 (None, 记录) —— 提交后没有环境反馈，
-        调用方据此终止循环。
+        提交类动作返回 (None, 记录) —— 提交后没有环境反馈，调用方据此终止循环。
         """
         llm = llm or {}
         index = self.step
@@ -260,6 +249,8 @@ class CodeEnv:
             llm_latency_ms=int(llm.get("latency_ms", 0)),
             prompt_tokens=int(llm.get("prompt_tokens", 0)),
             completion_tokens=int(llm.get("completion_tokens", 0)),
+            cache_hit_tokens=int(llm.get("cache_hit_tokens", 0)),
+            cache_miss_tokens=int(llm.get("cache_miss_tokens", 0)),
         )
 
         code = (action.tool_args or {}).get("code")
@@ -271,7 +262,7 @@ class CodeEnv:
                 # 被拒的提交同样消耗一步：否则模型反复提交越界代码时 step 永不前进，
                 # rollout 会无限循环烧 token（done 判定含 step >= max_steps，故能终止）。
                 self.step += 1
-                return self._finish(rec, deny, denied=True), rec
+                return self._finish(rec, deny), rec
             self.best_code, self.best_step = code, index
             rec.credited = True
             self.terminated_by = "submit"
@@ -282,7 +273,7 @@ class CodeEnv:
             deny = self._validate(action, code)
             if deny:
                 self.step += 1
-                return self._finish(rec, deny, denied=True), rec
+                return self._finish(rec, deny), rec
             obs = self._execute(code, rec)
             self.step += 1
             rec.finished_at = now_iso()
@@ -328,21 +319,19 @@ class CodeEnv:
         return None
 
     def _finish(
-        self, rec: StepRecord, deny: Optional[str], denied: bool = False
+        self, rec: StepRecord, deny: Optional[str]
     ) -> Optional[Observation]:
+        """收尾。deny 非空 = 这一步被拒，返回拒绝观测供模型重试；否则返回 None。"""
         rec.finished_at = rec.finished_at or now_iso()
-        if denied and deny:
-            rec.denied = True
-            rec.deny_reason = deny
-            self.denied += 1
-            if settings.SAFETY_ENFORCE and self.violations:
-                rec.safety_violations = list(self.violations)
-            return Observation(
-                content=f"已拒绝执行：{deny}。请移除越界操作后重新提交。",
-                success=False,
-                metadata={"denied": True},
-            )
-        return None
+        if not deny:
+            return None
+        rec.denied = True
+        rec.deny_reason = deny
+        self.denied += 1
+        return Observation(
+            content=f"已拒绝执行：{deny}。请移除越界操作后重新提交。",
+            success=False,
+        )
 
     # ---------- 执行 ----------
 
@@ -378,7 +367,7 @@ class CodeEnv:
                 text += "\n失败用例：" + json.dumps(fails[:3], ensure_ascii=False)
             if ok:
                 text += "\n全部通过。请输出 <final> 提交。"
-            return Observation(content=text, success=ok, metadata={"passed": passed})
+            return Observation(content=text, success=ok)
 
         # 自由任务：没有隐藏用例可判定，真实运行结果就是唯一反馈
         ok, out = run_code(code)
@@ -387,10 +376,21 @@ class CodeEnv:
             # 保留最后一次跑通的代码作为兜底提交
             self.best_score, self.best_code, self.best_step = 0.0, code, rec.step
         self.attempts.append({"step": rec.step, "ok": ok, "output": out[:200]})
+        if not ok:
+            text = "执行失败，输出：\n" + (out or "（进程没有任何输出就退出了）")
+        elif out:
+            text = "执行成功，输出：\n" + out
+        else:
+            # rc==0 但零输出：最常见的原因是只定义了函数却没人调用它，
+            # 报成"执行成功"会让模型以为这版代码没问题，原地反复重试。
+            text = (
+                "执行成功，但没有任何输出 —— 通常意味着你只定义了函数却没有调用它。"
+                "本任务没有隐藏测试来调用你的入口函数，请让脚本自己产生输出"
+                "（调用入口函数或直接 print 结果）。"
+            )
         return Observation(
             content=(
-                ("执行成功，输出：\n" if ok else "执行失败，输出：\n")
-                + out
+                text
                 + "\n（本任务没有隐藏测试，我无法判定对错，请自行核对后输出 <final> 提交。）"
             ),
             success=ok,

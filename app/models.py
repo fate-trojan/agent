@@ -12,17 +12,16 @@
 import uuid
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 # ===================== 六元组 =====================
 
 
 class State(BaseModel):
-    """状态空间 S：环境状态 + 观测历史。"""
+    """状态空间 S：某一决策点的环境状态快照。只存 env_state，不存对话历史。"""
 
     env_state: Dict[str, Any] = Field(default_factory=dict)
-    history: List[Dict[str, str]] = Field(default_factory=list)
     step: int = 0
 
 
@@ -42,7 +41,6 @@ class Observation(BaseModel):
 
     content: str
     success: bool
-    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class SafetyViolation(BaseModel):
@@ -54,19 +52,12 @@ class SafetyViolation(BaseModel):
 
 
 class StepRecord(BaseModel):
-    """单步的审计与信用记录。
-
-    两个用途：
-      - #12 可审计：这一步的动作、参数、耗时、token、错误全在这里；
-      - #10 步级信用：verify_delta 记录「这一步相对此前最好成绩提升了多少」，
-        从而能把轨迹级的优势下钻到具体是哪一步产生了有效改进。
-    """
+    """单步的审计与信用记录：#12 的动作/参数/耗时/token/错误，#10 的步级信用。"""
 
     step: int
     action_type: str
     parse_failed: bool = False
     tool_name: Optional[str] = None
-    code_chars: int = 0
 
     # ---- 环境判定 ----
     passed: int = 0
@@ -79,23 +70,21 @@ class StepRecord(BaseModel):
     denied: bool = False               # 被拒绝执行（未进入环境）
     deny_reason: str = ""
     error: str = ""                    # 本步的失败说明（协议未识别 / 执行报错）
-    safety_violations: List[SafetyViolation] = Field(default_factory=list)
 
     # ---- 计量 ----
     llm_latency_ms: int = 0
     exec_latency_ms: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    #: DeepSeek 前缀缓存命中/未命中的输入 token（计费差 10~70 倍，必须单独看）
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
     started_at: str = ""
     finished_at: str = ""
 
 
 class Trajectory(BaseModel):
-    """完整轨迹 τ = (s₀, a₀, o₀, r₀, ..., s_T)。
-
-    奖励约定：稀疏终点奖励 —— 除最后一步外 rewards 全为 0，
-    最后一步承载 Judge 给出的总奖励。
-    """
+    """完整轨迹 τ = (s₀, a₀, o₀, r₀, ..., s_T)。稀疏终点奖励：最后一步承载总奖励。"""
 
     task_id: str
     task_prompt: str = ""
@@ -103,6 +92,7 @@ class Trajectory(BaseModel):
     # ---- 可审计标识 ----
     trajectory_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:16])
     run_id: str = ""                   # 所属训练轮次；独立推理时为空
+    session_id: str = ""               # 多轮会话标识；空 = 单轮无记忆
     started_at: str = ""
     finished_at: str = ""
     duration_ms: int = 0
@@ -115,6 +105,13 @@ class Trajectory(BaseModel):
     steps: List[StepRecord] = Field(default_factory=list)
     total_reward: float = 0.0
     success: bool = False
+
+    # ---- 本轮走哪条路径 ----
+    #: codegen = 代码生成闭环（有执行、有判定、有奖励）；chat = 通用对话（直接回答）
+    mode: Literal["codegen", "chat"] = "codegen"
+    #: chat 模式的回答正文；codegen 模式为空 —— 两者分开存，记忆回放时才不会
+    #: 把一段闲聊当成代码塞进 ```python 围栏里
+    reply: str = ""
 
     # ---- 训练拆解信息 ----
     final_code: str = ""
@@ -132,10 +129,21 @@ class Trajectory(BaseModel):
     safety_violations: List[SafetyViolation] = Field(default_factory=list)
 
     # ---- 成本计量 ----
+    #: 以下四项只统计策略自身的调用（judge / 蒸馏的 prompt 每次都不同，缓存命中率
+    #: 恒接近 0，单独记在 judge_tokens 里，混进来只会稀释这里的命中率）
     llm_calls: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
     judge_tokens: int = 0                          # judge 自身的用量，与策略用量分开记
+
+    @computed_field  # 派生的，不能当输入传；没有 computed_field 它不会出现在 JSON 里
+    @property
+    def cache_hit_rate(self) -> float:
+        """输入 token 的缓存命中率。训练时 system prompt 固定，这个值应该很高。"""
+        total = self.cache_hit_tokens + self.cache_miss_tokens
+        return round(self.cache_hit_tokens / total, 4) if total else 0.0
 
     # ---- 环境终态（可审计环境状态）----
     final_env_state: Dict[str, Any] = Field(default_factory=dict)
@@ -162,11 +170,7 @@ class Rule(BaseModel):
 
 
 class PolicyAsset(BaseModel):
-    """策略资产 θ = base_prompt + rules。
-
-    πθ 的输出分布完全由 render() 出来的 system prompt 决定；
-    对 θ 的"训练"就是改写这个对象再落盘。
-    """
+    """策略资产 θ = base_prompt + rules。πθ 的输出分布完全由 render() 出来的 system prompt 决定。"""
 
     task_type: str = "codegen"
     version: int = 0
@@ -213,14 +217,25 @@ class AgentRequest(BaseModel):
     )
     max_steps: int = 3
     temperature: float = 0.7
+    session_id: str = Field(
+        default="default",
+        description="多轮会话标识。不给就是 default 会话 —— 连续的 curl 会自动接上"
+        "上一轮的提问与代码，「显示一下刚才的结果」这类指代才成立。"
+        "传空串 \"\" 表示这一轮不要上下文；传新 id 开一段互不干扰的对话。",
+    )
 
 
 class AgentResponse(BaseModel):
+    """单条轨迹的结果摘要。完整轨迹用 GET /runs/{trajectory_id} 取 —— 每步都带观测
+    与计量，直接塞进这里会让响应变成一堵墙。
+    """
+
     task_id: Optional[str] = None
     result: str
-    trajectory: Trajectory
     success: bool
     verifiable: bool
+    #: 用 GET /runs/{trajectory_id} 取回这条轨迹的每一步
+    trajectory_id: str = ""
     #: 轨迹落盘位置。审计时用它回溯这条轨迹的每一步、每个工具调用与判定依据
     trace_path: str = ""
 
@@ -233,11 +248,7 @@ class TrainingRequest(BaseModel):
 
 
 class Escalation(BaseModel):
-    """需要人工介入的事件。
-
-    自治设计的边界就体现在这里：能自动判定的（验证、回滚、停机）自动做掉，
-    只有这几种情况才交给人 —— 安全红线、收敛失败、预算超支、异常。
-    """
+    """需要人工介入的事件。能自动判定的（验证、回滚、停机）都不走这里。"""
 
     code: Literal[
         "safety_violation",
@@ -273,6 +284,11 @@ class TrainingStatus(BaseModel):
     escalations: List[Escalation] = Field(default_factory=list)
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
+    judge_tokens: int = 0               # judge 调用用量（prompt 每次不同，无缓存红利）
+    distill_tokens: int = 0             # 规则蒸馏调用用量
+    llm_calls: int = 0
 
 
 class EvalResult(BaseModel):
@@ -312,5 +328,27 @@ class TrainResult(BaseModel):
     # ---- 成本与自治边界 ----
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
+    judge_tokens: int = 0               # judge 调用用量（prompt 每次不同，无缓存红利）
+    distill_tokens: int = 0             # 规则蒸馏调用用量
+    llm_calls: int = 0
     needs_human: bool = False
     escalations: List[Escalation] = Field(default_factory=list)
+
+    @computed_field
+    @property
+    def total_tokens(self) -> int:
+        """本轮训练的全部 token 消耗（策略 + judge + 蒸馏）。"""
+        return (
+            self.prompt_tokens
+            + self.completion_tokens
+            + self.judge_tokens
+            + self.distill_tokens
+        )
+
+    @computed_field
+    @property
+    def cache_hit_rate(self) -> float:
+        total = self.cache_hit_tokens + self.cache_miss_tokens
+        return round(self.cache_hit_tokens / total, 4) if total else 0.0

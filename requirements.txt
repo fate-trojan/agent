@@ -3,8 +3,8 @@ uvicorn[standard]==0.34.0
 openai==1.58.1
 pydantic==2.10.4
 pydantic-settings==2.7.1
-numpy==2.2.1
 
-# 注: 未引入 python-dotenv。pydantic-settings 自身即读取 .env，
+# 注: 未引入 numpy —— GRPO 只需要均值与总体标准差，标准库 statistics 足够。
+# 未引入 python-dotenv。pydantic-settings 自身即读取 .env，
 # 两者共存会出现"改了 .env 不生效"的排查陷阱。
 # 也未引入 torch/transformers/trl —— 本实现不做梯度更新，见 README「这是什么/不是什么」。

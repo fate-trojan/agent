@@ -1,21 +1,7 @@
-"""FastAPI 入口。
+"""FastAPI 入口：MVP 阶段把 router 合并进了本文件。
 
-MVP 阶段把 router 合并进了本文件，端点共 11 个：
-
-    GET  /health                     探活 + 当前 θ 摘要
-    GET  /tasks                      任务清单（含隐藏用例数）
-    POST /agent/run                  跑一条轨迹，看 πθ 当前水平（自动落盘）
-    POST /training/start             启动一轮训练（后台任务）
-    GET  /training/status            训练进度
-    POST /training/stop              手动停止
-    GET  /training/result            最近一次训练的前后对照结果
-    GET  /training/asset             当前 θ（可直接阅读规则库）
-    POST /training/asset/reset       清空规则库，回到 θ₀
-    GET  /runs                       最近的轨迹与训练运行（审计）
-    GET  /runs/{trajectory_id}       按 id 取回一条完整轨迹（审计）
-
-后两个端点是「可审计」的落地接口：#4 要求任何一次判定都能回溯到具体轨迹、
-产物与环境状态，光把轨迹写在内存里返给调用方是不够的，必须能被事后查回来。
+/runs 与 /runs/{trajectory_id} 是「可审计」的落地接口：#4 要求任何一次判定都能
+回溯到具体轨迹、产物与环境状态，光把轨迹返给调用方不够，必须能被事后查回来。
 """
 
 import asyncio
@@ -23,7 +9,7 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 
-from app.agent import Agent
+from app.agent import Agent, detect_mode
 from app.asset import AssetStore
 from app.config import settings
 from app.grpo import GRPOTrainer
@@ -88,37 +74,57 @@ async def list_tasks() -> dict:
 async def run_agent(req: AgentRequest) -> AgentResponse:
     _require_key()
     if req.task_id:
-        # 指令如：curl -s -X POST localhost:8000/agent/run -H 'Content-Type: application/json' -d '{"task":"","task_id":"two_sum"}'
         try:
             task = get_task(req.task_id)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
     else:
         # 临时任务没有隐藏用例，奖励退化为纯 judge 分，不可验证
-        # 指令如：curl -s -X POST localhost:8000/agent/run -H 'Content-Type: application/json' -d '{"task":"请帮我写一个Python脚本，画个爱心","max_steps":10,"temperature":0.5}'
         task = TaskSpec(id="adhoc", prompt=req.task, tests=[])
 
     store = AssetStore()
     agent = Agent(store.asset)
-    traj = await agent.rollout(
-        task, max_steps=req.max_steps, temperature=req.temperature
-    )
-    await Judge().score(traj, task)
+    session_id = req.session_id
+    # 带上该会话上一轮的提问与产出，否则「显示一下刚才画的结果」无从指代
+    prior = TraceStore().last_turn(session_id)
 
-    # 落盘：独立推理的轨迹也要能被事后审计，否则"这条判定依据是什么"无从查证
+    # 关键词路由：命中代码词走 RL 闭环，否则走通用对话（见 app/agent.py:detect_mode）
+    mode = detect_mode(req.task)
+    common = dict(temperature=req.temperature, prior=prior, session_id=session_id)
+    traj = await (
+        agent.reply(task, **common)
+        if mode == "chat"
+        else agent.rollout(task, max_steps=req.max_steps, **common)
+    )
+    if mode == "codegen":
+        await Judge().score(traj, task)
+
+    # 落盘：独立推理的轨迹也要能事后审计，这份同时是下一轮的会话记忆来源
     traj.trace_path = TraceStore().write_trajectory(traj, task)
 
+    memory = f"会话 {session_id}：续用 {len(prior)} 条历史" if session_id else "无会话记忆"
+    head = (
+        "模式=chat（通用对话，无判定）"
+        if mode == "chat"
+        else f"模式=codegen verify={traj.verify_score:.0%} judge={traj.judge_score:.2f}"
+        f" reward={traj.total_reward:.3f} θ=v{traj.asset_version}"
+    )
+    # chat 只有 reply，codegen 只有 final_code —— 用 or 一次覆盖两种
+    body = traj.reply or f"{traj.judge_rationale}\n\n{traj.final_code}"
     result = (
-        f"verify={traj.verify_score:.0%} judge={traj.judge_score:.2f} "
-        f"reward={traj.total_reward:.3f} θ=v{traj.asset_version}\n"
-        f"{traj.judge_rationale}\n\n{traj.final_code}"
+        f"{head}｜{memory}\n"
+        f"tokens 输入 {traj.prompt_tokens}（缓存命中 {traj.cache_hit_tokens}"
+        f" / 未命中 {traj.cache_miss_tokens}，命中率 {traj.cache_hit_rate:.0%}）"
+        f"，输出 {traj.completion_tokens}，judge {traj.judge_tokens}"
+        f"，共 {traj.llm_calls} 次调用 / {traj.duration_ms}ms\n"
+        f"{body}"
     )
     return AgentResponse(
         task_id=req.task_id,
         result=result,
-        trajectory=traj,
         success=traj.success,
         verifiable=bool(task.tests),
+        trajectory_id=traj.trajectory_id,
         trace_path=traj.trace_path,
     )
 
@@ -169,7 +175,7 @@ async def training_status() -> TrainingStatus:
         return TrainingStatus(message="尚未启动过训练")
     return _trainer.status
 
-# 手动停止训练：curl -X POST http://127.0.0.1:8000/training/stop
+
 @app.post("/training/stop")
 async def stop_training() -> dict:
     if _trainer is None or not _trainer.status.running:
@@ -192,6 +198,7 @@ async def get_asset(task_type: str = "codegen") -> PolicyAsset:
 
 @app.post("/training/asset/reset")
 async def reset_asset(task_type: str = "codegen") -> dict:
+    """清空规则库回到 θ₀。base_prompt 是手写资产，reset 不动它。"""
     store = AssetStore(task_type)
     store.reset()
     return {"reset": True, "task_type": task_type, "asset_version": store.version}
@@ -202,11 +209,10 @@ async def reset_asset(task_type: str = "codegen") -> dict:
 
 @app.get("/runs")
 async def list_runs(limit: int = 20) -> dict:
-    """最近的轨迹与训练运行清单（每条 trajectory 只回摘要，正文用 /runs/{id} 取）。
+    """最近的轨迹与训练运行清单（每条轨迹只回摘要，正文用 /runs/{id} 取）。
 
-    列表刻意不带完整轨迹：训练一次可能产生上百条轨迹，每条都带十几次 LLM
-    往返的历史，全量返回会把响应撑爆。摘要里保留 id、判定结果与落盘位置，
-    足以定位，再按 id 取详情。
+    一次训练可能产生上百条轨迹，各自带十几次 LLM 往返的历史，全量返回会把响应
+    撑爆；摘要保留 id、判定结果与落盘位置，足以定位。
     """
     trace = TraceStore()
     trajs = trace.recent_trajectories(limit=limit)

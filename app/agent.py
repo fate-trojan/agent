@@ -16,10 +16,10 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from openai import AsyncOpenAI
-
+from app.asset import CHAT_SUFFIX
 from app.config import settings
-from app.env import CodeEnv, elapsed_ms, now_iso, run_code, run_tests
+from app.env import CodeEnv, elapsed_ms, now_iso, run_tests
+from app.llm import client
 from app.models import Action, PolicyAsset, State, TaskSpec, Trajectory
 
 _FINAL_RE = re.compile(r"<final>(.*?)</final>", re.S | re.I)
@@ -41,11 +41,8 @@ def _extract_code(body: str) -> Optional[str]:
 
 
 def parse_action(text: str) -> Action:
-    """把 LLM 原始输出解析成动作。
-
-    协议解析是纯文本匹配，模型不遵守格式时不会抛异常，而是降级为
-    think（parse_failed=True），让 rollout 用一次步数换一次重新对齐的机会。
-    """
+    """把 LLM 原始输出解析成动作。模型不遵守格式时不抛异常，而是降级为
+    think（parse_failed=True），让 rollout 用一次步数换一次重新对齐的机会。"""
     text = text or ""
 
     m = _FINAL_RE.search(text)
@@ -84,17 +81,64 @@ def parse_action(text: str) -> Action:
     return Action(type="think", content=text.strip(), parse_failed=True)
 
 
+# ===================== 输入路由 =====================
+
+
+#: 命中任一关键词走 codegen 闭环，否则走通用对话（README 有一张同样的表）。
+#: ponytail: 关键词是脆的（「写首歌」会被判成闲聊）。要准就得让 LLM 先分类 ——
+#: 多一次调用 + 一个失败点；或者干脆拆成 /agent/code 与 /agent/chat 由调用方指定。
+CODEGEN_KEYWORDS: Tuple[str, ...] = (
+    "代码", "脚本", "函数", "程序", "算法", "实现", "编写", "写一个", "写个",
+    "调试", "报错", "修复", "重构", "优化", "单元测试", "正则", "爬虫", "接口",
+    "数据库", "排序", "递归", "画", "打印", "计算", "求解", "解题",
+    "code", "script", "function", "python", "bug", "debug", "refactor",
+    "algorithm", "sql", "regex", "api", "def ", "class ",
+)
+
+
+def detect_mode(task: str) -> str:
+    """按关键词决定这一轮走 codegen 闭环还是通用对话。"""
+    text = (task or "").lower()
+    return "codegen" if any(k in text for k in CODEGEN_KEYWORDS) else "chat"
+
+
+def _meter(traj: Trajectory, meta: Dict[str, int]) -> None:
+    """把一次采样的计量累加进轨迹。两条路径（闭环 / 对话）共用同一套记账。"""
+    traj.llm_calls += 1
+    traj.prompt_tokens += meta.get("prompt_tokens", 0)
+    traj.completion_tokens += meta.get("completion_tokens", 0)
+    traj.cache_hit_tokens += meta.get("cache_hit_tokens", 0)
+    traj.cache_miss_tokens += meta.get("cache_miss_tokens", 0)
+
+
 # ===================== 策略 πθ =====================
 
 
 def _usage_of(resp: Any) -> Dict[str, int]:
-    """从响应里取 token 用量。取不到就当 0（不影响主流程，但审计里要能看出缺失）。"""
+    """从响应里取 token 用量。取不到就当 0（不影响主流程，但审计里要能看出缺失）。
+
+    DeepSeek 的缓存命中/未命中是它自己的扩展字段，OpenAI 原生 SDK 的 Usage 模型里
+    没有，靠 pydantic 的 extra 透传。透传到 model_extra 还是能直接取属性随 SDK 版本
+    而定，两条路都走一遍 —— 取不到就静默返回 0，那会把"没统计到"伪装成"命中率 0%"。
+    """
     usage = getattr(resp, "usage", None)
     if usage is None:
-        return {"prompt_tokens": 0, "completion_tokens": 0}
+        return dict.fromkeys(
+            ("prompt_tokens", "completion_tokens", "cache_hit_tokens", "cache_miss_tokens"), 0
+        )
+    extra = getattr(usage, "model_extra", None) or {}
+
+    def num(name: str) -> int:
+        v = getattr(usage, name, None)
+        if v is None:
+            v = extra.get(name)
+        return int(v or 0)
+
     return {
-        "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
-        "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+        "prompt_tokens": num("prompt_tokens"),
+        "completion_tokens": num("completion_tokens"),
+        "cache_hit_tokens": num("prompt_cache_hit_tokens"),
+        "cache_miss_tokens": num("prompt_cache_miss_tokens"),
     }
 
 
@@ -102,15 +146,8 @@ class Agent:
     """πθ(a_t | s_t)：给定 θ（渲染为 system prompt）与观测历史，采样下一步动作。"""
 
     def __init__(self, asset: PolicyAsset):
-        if not settings.llm_configured:
-            raise RuntimeError(
-                "DEEPSEEK_API_KEY 未配置。请 `cp .env.example .env` 后填入真实 Key。"
-            )
         self.asset = asset
-        self.client = AsyncOpenAI(
-            api_key=settings.DEEPSEEK_API_KEY,
-            base_url=settings.DEEPSEEK_BASE_URL,
-        )
+        self.client = client()
 
     async def _chat(
         self, messages: List[Dict[str, str]], temperature: float, max_tokens: int = 2048
@@ -140,10 +177,15 @@ class Agent:
         max_steps: Optional[int] = None,
         temperature: Optional[float] = None,
         run_id: str = "",
+        prior: Optional[List[Dict[str, str]]] = None,
+        session_id: str = "",
     ) -> Trajectory:
         """跑完一条完整轨迹：act → dispatch → observe → act ...
 
-        循环条件、终止条件、状态变更全部由 CodeEnv 决定；这里只负责决策与记账。
+        循环与终止条件、状态变更全部由 CodeEnv 决定，这里只负责决策与记账。
+
+        prior 是上一轮会话的对话前缀（提问 + 产出）。它让「显示一下刚才画的结果」
+        这类指代有东西可指 —— 没有它，模型只能自己另编一个"刚才"。
         """
         max_steps = max_steps or settings.MAX_STEPS
         temperature = settings.ACT_TEMPERATURE if temperature is None else temperature
@@ -153,24 +195,23 @@ class Agent:
         traj = Trajectory(
             task_id=task.id,
             task_prompt=task.prompt,
+            mode="codegen",
             asset_version=self.asset.version,
             run_id=run_id,
+            session_id=session_id,
             started_at=now_iso(),
         )
-        history: List[Dict[str, str]] = [{"role": "user", "content": task.prompt}]
+        history: List[Dict[str, str]] = list(prior or [])
+        history.append({"role": "user", "content": task.prompt})
 
         while not env.done:
-            traj.states.append(
-                State(env_state=env.snapshot(), history=list(history), step=env.step)
-            )
+            traj.states.append(State(env_state=env.snapshot(), step=env.step))
 
             text, meta = await self._chat(
                 [{"role": "system", "content": self.asset.render()}] + history,
                 temperature,
             )
-            traj.llm_calls += 1
-            traj.prompt_tokens += meta.get("prompt_tokens", 0)
-            traj.completion_tokens += meta.get("completion_tokens", 0)
+            _meter(traj, meta)
 
             action = parse_action(text)
             traj.actions.append(action)
@@ -211,5 +252,39 @@ class Agent:
         traj.duration_ms = elapsed_ms(t0)
         return traj
 
+    async def reply(
+        self,
+        task: TaskSpec,
+        temperature: Optional[float] = None,
+        prior: Optional[List[Dict[str, str]]] = None,
+        session_id: str = "",
+    ) -> Trajectory:
+        """通用对话：一次调用直接回答，不进 CodeEnv 闭环。
 
-__all__ = ["Agent", "parse_action", "run_code", "run_tests"]
+        没有执行、没有隐藏测试，也就没有可验证奖励与 judge —— 产出就是那段文本。
+        """
+        temperature = settings.ACT_TEMPERATURE if temperature is None else temperature
+
+        t0 = time.perf_counter()
+        traj = Trajectory(
+            task_id=task.id,
+            task_prompt=task.prompt,
+            mode="chat",
+            asset_version=self.asset.version,
+            session_id=session_id,
+            started_at=now_iso(),
+        )
+        history: List[Dict[str, str]] = list(prior or [])
+        history.append({"role": "user", "content": task.prompt})
+
+        # CHAT_SUFFIX 追加在 base_prompt 之后，把其中的代码输出协议压掉
+        text, meta = await self._chat(
+            [{"role": "system", "content": self.asset.render() + CHAT_SUFFIX}] + history,
+            temperature,
+        )
+        _meter(traj, meta)
+        traj.reply = text.strip()
+
+        traj.finished_at = now_iso()
+        traj.duration_ms = elapsed_ms(t0)
+        return traj

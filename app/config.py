@@ -1,12 +1,3 @@
-"""全局配置。
-
-与原始设计稿的两处差异：
-1. Pydantic v2 用 `model_config = SettingsConfigDict(...)`，原来的 `class Config`
-   在 v2 里已被弃用，字段会静默地不按预期加载。
-2. 去掉了 LEARNING_RATE / KL_COEF —— 本实现不做梯度更新，保留这两个字段
-   会误导阅读者以为存在反向传播。替换为真实存在的边界参数。
-"""
-
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 

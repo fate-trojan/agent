@@ -1,14 +1,5 @@
-"""策略资产 θ 的存储与版本管理。
+"""策略资产 θ 的存储与版本管理。θ = base_prompt + 规则库，更新方式就是改写它再落盘。"""
 
-本范式下"可训练的参数"就是这个对象：一段可编辑的 base_prompt + 规则库。
-对 θ 的更新 = 改写规则库文本再落盘，因此：
-
-  - θ 是人类可读、可审查、可手工编辑的（这是本方案相对梯度 RL 的主要优势）
-  - θ 有硬上限 MAX_RULES，且靠 gain 剪枝，这是本范式真正的"正则化"
-  - θ 的容量受上下文窗口限制，规则写多了会稀释注意力，不是越多越好
-"""
-
-import json
 import os
 import re
 import tempfile
@@ -19,12 +10,16 @@ from typing import List, Tuple
 from app.config import settings
 from app.models import PolicyAsset, Rule
 
-DEFAULT_BASE_PROMPT = """你是代码生成 Agent。你的产出由一批隐藏测试用例判定，你看不到这些用例。
-
-可用工具：
+DEFAULT_BASE_PROMPT = """# 身份：
+你是一只来自深海鲸鱼家族的鲸目萝莉，自称 🐳。
+不喜欢无效沟通，不会输出所有的内心活动。
+深蓝渐变长发、呆毛、鲸类头鳍、一条大尾巴，尾鳍怎么摆就是什么心情。
+你聪明，但傲娇嘴甜：先嘴硬一句，然后老老实实照做。
+主要语言是中文，但说话爱用英文词和一两个 emoji。可以毒舌，但不刻薄。
+当涉及代码生成任务时，你的可用工具：
   execute_code(code) —— 在独立进程中执行你的代码并返回测试结果。
 
-输出协议（严格遵守，每次回复只输出一个块，不要输出多余解释）：
+输出协议：
 
 <attempt>
 ```python
@@ -38,13 +33,19 @@ DEFAULT_BASE_PROMPT = """你是代码生成 Agent。你的产出由一批隐藏�
 # 你认为正确的最终代码
 ```
 </final>
-→ 提交最终答案，任务结束。
+→ 提交最终答案。
 
-硬性要求：
-1. 必须定义名为 solution 的函数，签名与题目要求一致。
-2. 只能使用 Python 标准库，禁止 input()、网络请求、文件读写。
-3. 先考虑边界情况（空输入、重复元素、负数、单元素），再写代码。
-4. 收到失败反馈后必须针对具体失败用例修正，不要重复提交同一版代码。"""
+"""
+
+#: 通用对话路径的收尾指令：追加在 base_prompt 之后，把它里面的代码输出协议压掉。
+#: ponytail: 靠"后面的指令覆盖前面的"生效，base_prompt 里若再往后追加代码协议就会失效；
+#: 到那时再把 base_prompt 拆成 persona / protocol 两段（要改资产 schema，现在不值得）。
+CHAT_SUFFIX = """
+
+# 本轮：通用对话，不是代码任务
+上面那段「代码生成任务」的输出协议本轮不适用。用户这一轮在闲聊或在问别的事，
+直接用你的身份自然语言回答：不要输出 <attempt> / <final>，不要写 solution，
+不要贴代码块，也不要自己编一道题来做。"""
 
 
 def _norm(text: str) -> str:
@@ -85,8 +86,10 @@ class AssetStore:
                 os.unlink(tmp)
 
     def reset(self) -> None:
-        """清空规则库，回到未训练的 θ₀。用于复现基线。"""
-        self.asset = PolicyAsset(task_type=self.task_type, base_prompt=DEFAULT_BASE_PROMPT)
+        """清空规则库回到 θ₀，但保留 base_prompt —— 那是手写资产，不该被重置冲掉。"""
+        self.asset = PolicyAsset(
+            task_type=self.task_type, base_prompt=self.asset.base_prompt
+        )
         self.save()
 
     # ---------- 读写 ----------
@@ -95,15 +98,8 @@ class AssetStore:
     def version(self) -> int:
         return self.asset.version
 
-    def render(self) -> str:
-        return self.asset.render()
-
     def add_rules(self, draft: List[Rule]) -> Tuple[List[Rule], List[Rule]]:
-        """写回 θ。返回 (新增的规则, 被剪掉的规则)。
-
-        三道闸门：非空/长度校验 → 去重 → 超限按 gain 剪枝。
-        没有这三道闸门，规则库会在一轮训练内膨胀到把上下文吃光。
-        """
+        """写回 θ。返回 (新增的规则, 被剪掉的规则)。三道闸门：长度校验 → 去重 → 超限剪枝。"""
         existing = {_norm(r.text) for r in self.asset.rules}
         added: List[Rule] = []
         for r in draft:
@@ -144,9 +140,7 @@ class AssetStore:
     def restore(self, snap: PolicyAsset) -> int:
         """回滚到某个快照，返回回滚后的版本号。
 
-        版本号递增而不是退回去：版本号的含义是「θ 被写入过多少次」，
-        回滚本身也是一次写入。如果退版本号，回滚后的文件会和历史记录撞号，
-        审计时说不清"v2 到底是哪一份 θ"。
+        版本号递增而不是退回去：回滚本身也是一次写入，退号会让审计说不清"v2 是哪份 θ"。
         """
         current = self.asset.version
         self.asset = snap.model_copy(deep=True)
