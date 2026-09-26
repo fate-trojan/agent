@@ -1,16 +1,21 @@
 """FastAPI 入口。
 
-MVP 阶段把 router 合并进了本文件，端点只有 8 个：
+MVP 阶段把 router 合并进了本文件，端点共 11 个：
 
     GET  /health                     探活 + 当前 θ 摘要
     GET  /tasks                      任务清单（含隐藏用例数）
-    POST /agent/run                  跑一条轨迹，看 πθ 当前水平
+    POST /agent/run                  跑一条轨迹，看 πθ 当前水平（自动落盘）
     POST /training/start             启动一轮训练（后台任务）
     GET  /training/status            训练进度
     POST /training/stop              手动停止
     GET  /training/result            最近一次训练的前后对照结果
     GET  /training/asset             当前 θ（可直接阅读规则库）
     POST /training/asset/reset       清空规则库，回到 θ₀
+    GET  /runs                       最近的轨迹与训练运行（审计）
+    GET  /runs/{trajectory_id}       按 id 取回一条完整轨迹（审计）
+
+后两个端点是「可审计」的落地接口：#4 要求任何一次判定都能回溯到具体轨迹、
+产物与环境状态，光把轨迹写在内存里返给调用方是不够的，必须能被事后查回来。
 """
 
 import asyncio
@@ -31,8 +36,10 @@ from app.models import (
     TrainingRequest,
     TrainingStatus,
     TrainResult,
+    Trajectory,
 )
 from app.tasks import TASKS, get_task
+from app.trace import TraceStore
 
 app = FastAPI(title="Agent RL (MVP)", version="0.1.0")
 
@@ -98,6 +105,9 @@ async def run_agent(req: AgentRequest) -> AgentResponse:
     )
     await Judge().score(traj, task)
 
+    # 落盘：独立推理的轨迹也要能被事后审计，否则"这条判定依据是什么"无从查证
+    traj.trace_path = TraceStore().write_trajectory(traj, task)
+
     result = (
         f"verify={traj.verify_score:.0%} judge={traj.judge_score:.2f} "
         f"reward={traj.total_reward:.3f} θ=v{traj.asset_version}\n"
@@ -109,6 +119,7 @@ async def run_agent(req: AgentRequest) -> AgentResponse:
         trajectory=traj,
         success=traj.success,
         verifiable=bool(task.tests),
+        trace_path=traj.trace_path,
     )
 
 
@@ -184,6 +195,63 @@ async def reset_asset(task_type: str = "codegen") -> dict:
     store = AssetStore(task_type)
     store.reset()
     return {"reset": True, "task_type": task_type, "asset_version": store.version}
+
+
+# ===================== 审计：轨迹与运行的落盘检索 =====================
+
+
+@app.get("/runs")
+async def list_runs(limit: int = 20) -> dict:
+    """最近的轨迹与训练运行清单（每条 trajectory 只回摘要，正文用 /runs/{id} 取）。
+
+    列表刻意不带完整轨迹：训练一次可能产生上百条轨迹，每条都带十几次 LLM
+    往返的历史，全量返回会把响应撑爆。摘要里保留 id、判定结果与落盘位置，
+    足以定位，再按 id 取详情。
+    """
+    trace = TraceStore()
+    trajs = trace.recent_trajectories(limit=limit)
+    return {
+        "trajectories": [
+            {
+                "trajectory_id": t.get("trajectory_id"),
+                "run_id": t.get("run_id"),
+                "task": t.get("task", {}),
+                "at": t.get("at"),
+                "success": (t.get("trajectory") or {}).get("success"),
+                "verify_score": (t.get("trajectory") or {}).get("verify_score"),
+                "total_reward": (t.get("trajectory") or {}).get("total_reward"),
+                "safety_passed": (t.get("trajectory") or {}).get("safety_passed"),
+                "critical_step": (t.get("trajectory") or {}).get("critical_step"),
+            }
+            for t in trajs
+        ],
+        "runs": [
+            {
+                "run_id": r.get("run_id"),
+                "at": r.get("at"),
+                "rolled_back": (r.get("result") or {}).get("rolled_back"),
+                "needs_human": (r.get("result") or {}).get("needs_human"),
+                "escalations": (r.get("result") or {}).get("escalations", []),
+                "delta_success_rate": (r.get("result") or {}).get("delta_success_rate"),
+                "trace_path": (r.get("result") or {}).get("trace_path"),
+            }
+            for r in trace.recent_runs(limit=10)
+        ],
+        "rules": trace.recent_rules(limit=limit),
+    }
+
+
+@app.get("/runs/{trajectory_id}", response_model=dict)
+async def get_run(trajectory_id: str) -> dict:
+    """按 id 取回一条完整轨迹 —— 每一步的动作、环境状态、判定依据与计量。"""
+    item = TraceStore().find_trajectory(trajectory_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail=f"未找到轨迹 {trajectory_id}")
+    return {
+        "task": item.get("task", {}),
+        "at": item.get("at"),
+        "trajectory": Trajectory.model_validate(item.get("trajectory") or {}),
+    }
 
 
 if __name__ == "__main__":

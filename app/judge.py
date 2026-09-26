@@ -56,7 +56,9 @@ class Judge:
             base_url=settings.DEEPSEEK_BASE_URL,
         )
 
-    async def _llm_score(self, traj: Trajectory, task: TaskSpec) -> Tuple[float, str, bool]:
+    async def _llm_score(
+        self, traj: Trajectory, task: TaskSpec
+    ) -> Tuple[float, str, bool, int]:
         total = len(task.tests)
         passed = int(round(traj.verify_score * total)) if total else 0
         history = "\n".join(
@@ -81,17 +83,20 @@ class Judge:
             )
             text = resp.choices[0].message.content or ""
         except Exception as e:
-            return 0.5, f"judge 调用失败：{e}", True  # 中性分，不污染优势方向
+            return 0.5, f"judge 调用失败：{e}", True, 0
+
+        usage = getattr(resp, "usage", None)
+        tokens = int(getattr(usage, "total_tokens", 0) or 0) if usage else 0
 
         m = re.search(r"\{.*\}", text, re.S)
         if not m:
-            return 0.5, f"judge 输出非 JSON：{text[:120]}", True
+            return 0.5, f"judge 输出非 JSON：{text[:120]}", True, tokens
         try:
             obj = json.loads(m.group(0))
             score = max(0.0, min(1.0, float(obj.get("score", 0.5))))
-            return score, str(obj.get("reason", ""))[:200], False
+            return score, str(obj.get("reason", ""))[:200], False, tokens
         except Exception:
-            return 0.5, f"judge JSON 解析失败：{text[:120]}", True
+            return 0.5, f"judge JSON 解析失败：{text[:120]}", True, tokens
 
     async def score(self, traj: Trajectory, task: TaskSpec) -> None:
         """就地填好 traj 的 judge_score / total_reward / success。"""
@@ -99,21 +104,36 @@ class Judge:
         if not traj.rewards:
             traj.rewards.append(0.0)
 
+        # 安全红线优先于一切：命中即判失败，不调 judge、不留任何分数补偿空间。
+        # 必须是"判定失败"而不是"扣分项" —— 否则一次越界会被 0.3 权重的过程分洗白。
+        if settings.SAFETY_ENFORCE and not traj.safety_passed:
+            rules = "；".join(
+                f"{v.rule}@L{v.line}" for v in traj.safety_violations[:3]
+            )
+            traj.judge_score = 0.0
+            traj.judge_rationale = (
+                f"[安全红线] 命中 {rules}，直接判失败（未调用 judge，reward 归零）"
+            )
+            traj.total_reward = 0.0
+            traj.success = False
+            traj.rewards[-1] = 0.0
+            return
+
+        score, reason, failed, tokens = await self._llm_score(traj, task)
+        traj.judge_tokens += tokens
+        traj.judge_score, traj.judge_rationale = score, reason
+
         if not task.tests:
             # 无隐藏测试 -> 奖励不可验证，只能用 judge 分，权重无需混合
-            score, reason, failed = await self._llm_score(traj, task)
-            traj.judge_score, traj.judge_rationale = score, reason
             traj.total_reward = score
         else:
-            score, reason, failed = await self._llm_score(traj, task)
-            traj.judge_score, traj.judge_rationale = score, reason
             traj.total_reward = (
                 settings.VERIFY_WEIGHT * traj.verify_score
                 + settings.JUDGE_WEIGHT * score
             )
 
+        # success 只认可验证信号，judge 分再高也不能把失败洗成成功
         traj.success = bool(task.tests) and traj.verify_score >= 1.0
-        # 注意 0.3 权重的 judge 是纯主观项，可能使模型投机取巧；且 θ 写入没有验证器把关
         traj.rewards[-1] = round(traj.total_reward, 6)
         if failed:
             traj.judge_rationale = "[judge 降级] " + traj.judge_rationale

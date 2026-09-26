@@ -45,6 +45,51 @@ class Observation(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+class SafetyViolation(BaseModel):
+    """一条被触发的安全红线。"""
+
+    rule: str
+    detail: str
+    line: int = 0
+
+
+class StepRecord(BaseModel):
+    """单步的审计与信用记录。
+
+    两个用途：
+      - #12 可审计：这一步的动作、参数、耗时、token、错误全在这里；
+      - #10 步级信用：verify_delta 记录「这一步相对此前最好成绩提升了多少」，
+        从而能把轨迹级的优势下钻到具体是哪一步产生了有效改进。
+    """
+
+    step: int
+    action_type: str
+    parse_failed: bool = False
+    tool_name: Optional[str] = None
+    code_chars: int = 0
+
+    # ---- 环境判定 ----
+    passed: int = 0
+    total: int = 0
+    verify_score: float = 0.0
+    verify_delta: float = 0.0          # 相对此前最好成绩的增量
+    credited: bool = False             # 该步的代码被作为最终提交
+
+    # ---- 越界与安全 ----
+    denied: bool = False               # 被拒绝执行（未进入环境）
+    deny_reason: str = ""
+    error: str = ""                    # 本步的失败说明（协议未识别 / 执行报错）
+    safety_violations: List[SafetyViolation] = Field(default_factory=list)
+
+    # ---- 计量 ----
+    llm_latency_ms: int = 0
+    exec_latency_ms: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    started_at: str = ""
+    finished_at: str = ""
+
+
 class Trajectory(BaseModel):
     """完整轨迹 τ = (s₀, a₀, o₀, r₀, ..., s_T)。
 
@@ -54,10 +99,20 @@ class Trajectory(BaseModel):
 
     task_id: str
     task_prompt: str = ""
+
+    # ---- 可审计标识 ----
+    trajectory_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:16])
+    run_id: str = ""                   # 所属训练轮次；独立推理时为空
+    started_at: str = ""
+    finished_at: str = ""
+    duration_ms: int = 0
+    trace_path: str = ""               # 落盘位置，便于回溯
+
     states: List[State] = Field(default_factory=list)
     actions: List[Action] = Field(default_factory=list)
     observations: List[Observation] = Field(default_factory=list)
     rewards: List[float] = Field(default_factory=list)
+    steps: List[StepRecord] = Field(default_factory=list)
     total_reward: float = 0.0
     success: bool = False
 
@@ -70,6 +125,20 @@ class Trajectory(BaseModel):
     advantage: float = 0.0                         # 组内相对优势 A_i
     asset_version: int = 0                         # 采样时使用的 θ 版本
     used_fallback_code: bool = False               # 未输出 <final>，回退到最优 attempt
+    critical_step: int = -1                        # 最终代码由第几步产生（步级归因）
+
+    # ---- 安全闭环 ----
+    safety_passed: bool = True
+    safety_violations: List[SafetyViolation] = Field(default_factory=list)
+
+    # ---- 成本计量 ----
+    llm_calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    judge_tokens: int = 0                          # judge 自身的用量，与策略用量分开记
+
+    # ---- 环境终态（可审计环境状态）----
+    final_env_state: Dict[str, Any] = Field(default_factory=dict)
 
 
 # ===================== 策略资产 θ =====================
@@ -84,6 +153,12 @@ class Rule(BaseModel):
     origin_task: str = ""
     gain: float = 0.0          # 写回 θ 时的组内优势估计，用于剪枝
     asset_version: int = 0
+
+    # ---- 经验溯源：这条规则是从哪一次运行、哪几条轨迹、哪一步蒸馏出来的 ----
+    origin_run_id: str = ""
+    origin_trajectory_ids: List[str] = Field(default_factory=list)
+    origin_step: int = -1      # 证据来自该轨迹的第几步（步级信用）
+    created_at: str = ""
 
 
 class PolicyAsset(BaseModel):
@@ -146,6 +221,8 @@ class AgentResponse(BaseModel):
     trajectory: Trajectory
     success: bool
     verifiable: bool
+    #: 轨迹落盘位置。审计时用它回溯这条轨迹的每一步、每个工具调用与判定依据
+    trace_path: str = ""
 
 
 class TrainingRequest(BaseModel):
@@ -153,6 +230,25 @@ class TrainingRequest(BaseModel):
     num_rollouts: int = 24
     epochs: int = 1
     group_size: Optional[int] = None
+
+
+class Escalation(BaseModel):
+    """需要人工介入的事件。
+
+    自治设计的边界就体现在这里：能自动判定的（验证、回滚、停机）自动做掉，
+    只有这几种情况才交给人 —— 安全红线、收敛失败、预算超支、异常。
+    """
+
+    code: Literal[
+        "safety_violation",
+        "regression",
+        "no_learning_signal",
+        "llm_failure",
+        "budget_exceeded",
+        "unexpected_error",
+    ]
+    detail: str
+    at: str = ""
 
 
 class TrainingStatus(BaseModel):
@@ -167,8 +263,16 @@ class TrainingStatus(BaseModel):
     asset_version: int = 0
     rules_count: int = 0
     updates_applied: int = 0
+    flat_groups: int = 0               # 组内无方差（无学习信号）的 group 数
     message: str = ""
     error: Optional[str] = None
+
+    # ---- 自治边界 ----
+    run_id: str = ""
+    needs_human: bool = False
+    escalations: List[Escalation] = Field(default_factory=list)
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 class EvalResult(BaseModel):
@@ -194,3 +298,19 @@ class TrainResult(BaseModel):
     delta_success_rate: float
     delta_avg_reward: float
     updates_log: List[str] = Field(default_factory=list)
+
+    # ---- 标识与落盘 ----
+    run_id: str = ""
+    trace_path: str = ""
+
+    # ---- θ 质量闸门：变差就回滚 ----
+    rolled_back: bool = False
+    rollback_reason: str = ""
+    #: 回滚前的（变差了的）eval 结果，保留下来供人工复盘
+    regressed_final: Optional[EvalResult] = None
+
+    # ---- 成本与自治边界 ----
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    needs_human: bool = False
+    escalations: List[Escalation] = Field(default_factory=list)

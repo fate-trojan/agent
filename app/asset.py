@@ -134,3 +134,23 @@ class AssetStore:
             self.asset.updated_at = datetime.now().isoformat(timespec="seconds")
             self.save()
         return added, pruned
+
+    # ---------- 快照与回滚 ----------
+
+    def snapshot(self) -> PolicyAsset:
+        """θ 的深拷贝。训练开始前留档，用于变差时自动回滚。"""
+        return self.asset.model_copy(deep=True)
+
+    def restore(self, snap: PolicyAsset) -> int:
+        """回滚到某个快照，返回回滚后的版本号。
+
+        版本号递增而不是退回去：版本号的含义是「θ 被写入过多少次」，
+        回滚本身也是一次写入。如果退版本号，回滚后的文件会和历史记录撞号，
+        审计时说不清"v2 到底是哪一份 θ"。
+        """
+        current = self.asset.version
+        self.asset = snap.model_copy(deep=True)
+        self.asset.version = current + 1
+        self.asset.updated_at = datetime.now().isoformat(timespec="seconds")
+        self.save()
+        return self.asset.version

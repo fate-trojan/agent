@@ -45,6 +45,24 @@ class Settings(BaseSettings):
     # ---- 环境 ----
     ASSET_DIR: str = "assets"
     EXEC_TIMEOUT: float = 6.0
+    #: 单次提交代码的字符上限。超限直接拒绝，不执行（工具参数校验）
+    MAX_CODE_CHARS: int = 20000
+
+    # ---- 安全红线 ----
+    #: True = 命中红线直接判失败（reward 归零），而不是仅扣分
+    SAFETY_ENFORCE: bool = True
+
+    # ---- 可审计轨迹 ----
+    TRACE_DIR: str = "runs"
+    TRACE_ENABLED: bool = True
+
+    # ---- 自治边界（人工介入触发条件）----
+    #: 训练 token 预算，0 表示不限。超出即停机并升级人工
+    TOKEN_BUDGET: int = 0
+    #: 连续多少个 group 组内奖励无方差（无学习信号）就升级人工
+    MAX_FLAT_GROUPS: int = 4
+    #: eval 变差时是否自动回滚 θ 到本轮基线
+    ROLLBACK_ON_REGRESSION: bool = True
 
     @property
     def llm_configured(self) -> bool:
